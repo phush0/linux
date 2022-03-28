@@ -1,0 +1,2039 @@
+From df84add27f0e5a72e3f1f82f3afa15311d83ee71 Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Tue, 19 Oct 2021 22:24:24 +0100
+Subject: [PATCH 01/15] block: optimise blk_may_split for normal rw
+
+Read/write/flush are the most common operations, optimise switch in
+blk_may_split() for these cases. All three added conditions are compiled
+into a single comparison as the corresponding REQ_OP_* take 0-2.
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Link: https://lore.kernel.org/r/9ded7cf6a3af7e6e577d12a835a385657da4a69e.1634676157.git.asml.silence@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ block/blk.h | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/block/blk.h b/block/blk.h
+index 8bd43b3ad33d..13534cbe7170 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -282,14 +282,18 @@ ssize_t part_timeout_store(struct device *, struct device_attribute *,
+ 
+ static inline bool blk_may_split(struct request_queue *q, struct bio *bio)
+ {
+-	switch (bio_op(bio)) {
+-	case REQ_OP_DISCARD:
+-	case REQ_OP_SECURE_ERASE:
+-	case REQ_OP_WRITE_ZEROES:
+-	case REQ_OP_WRITE_SAME:
+-		return true; /* non-trivial splitting decisions */
+-	default:
+-		break;
++	unsigned int op = bio_op(bio);
++
++	if (op != REQ_OP_READ && op != REQ_OP_WRITE && op != REQ_OP_FLUSH) {
++		switch (op) {
++		case REQ_OP_DISCARD:
++		case REQ_OP_SECURE_ERASE:
++		case REQ_OP_WRITE_ZEROES:
++		case REQ_OP_WRITE_SAME:
++			return true; /* non-trivial splitting decisions */
++		default:
++			break;
++		}
+ 	}
+ 
+ 	/*
+-- 
+2.35.1
+
+
+From 6122119f21fe1c132142c8779ba9d2936c102e6d Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Tue, 19 Oct 2021 22:24:25 +0100
+Subject: [PATCH 02/15] block: optimise submit_bio_checks for normal rw
+
+Optimise the switch in submit_bio_checks() for reads, writes and
+flushes. REQ_OP_READ/WRITE/FLUSH take numbers from 0 to 2, so the added
+checks are compiled into a single condition:
+
+if (op <= REQ_OP_FLUSH) {} else { switch() ... };
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Link: https://lore.kernel.org/r/c53849108e8c2b831e78cd58b44244b27df43ab6.1634676157.git.asml.silence@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ block/blk-core.c | 74 +++++++++++++++++++++++++-----------------------
+ 1 file changed, 39 insertions(+), 35 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 779b4a1f66ac..e51ef02048b5 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -682,6 +682,7 @@ noinline_for_stack bool submit_bio_checks(struct bio *bio)
+ 	struct request_queue *q = bdev_get_queue(bdev);
+ 	blk_status_t status = BLK_STS_IOERR;
+ 	struct blk_plug *plug;
++	unsigned op;
+ 
+ 	might_sleep();
+ 
+@@ -723,41 +724,44 @@ noinline_for_stack bool submit_bio_checks(struct bio *bio)
+ 	if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
+ 		bio_clear_polled(bio);
+ 
+-	switch (bio_op(bio)) {
+-	case REQ_OP_DISCARD:
+-		if (!blk_queue_discard(q))
+-			goto not_supported;
+-		break;
+-	case REQ_OP_SECURE_ERASE:
+-		if (!blk_queue_secure_erase(q))
+-			goto not_supported;
+-		break;
+-	case REQ_OP_WRITE_SAME:
+-		if (!q->limits.max_write_same_sectors)
+-			goto not_supported;
+-		break;
+-	case REQ_OP_ZONE_APPEND:
+-		status = blk_check_zone_append(q, bio);
+-		if (status != BLK_STS_OK)
+-			goto end_io;
+-		break;
+-	case REQ_OP_ZONE_RESET:
+-	case REQ_OP_ZONE_OPEN:
+-	case REQ_OP_ZONE_CLOSE:
+-	case REQ_OP_ZONE_FINISH:
+-		if (!blk_queue_is_zoned(q))
+-			goto not_supported;
+-		break;
+-	case REQ_OP_ZONE_RESET_ALL:
+-		if (!blk_queue_is_zoned(q) || !blk_queue_zone_resetall(q))
+-			goto not_supported;
+-		break;
+-	case REQ_OP_WRITE_ZEROES:
+-		if (!q->limits.max_write_zeroes_sectors)
+-			goto not_supported;
+-		break;
+-	default:
+-		break;
++	op = bio_op(bio);
++	if (op != REQ_OP_READ && op != REQ_OP_WRITE && op != REQ_OP_FLUSH) {
++		switch (op) {
++		case REQ_OP_DISCARD:
++			if (!blk_queue_discard(q))
++				goto not_supported;
++			break;
++		case REQ_OP_SECURE_ERASE:
++			if (!blk_queue_secure_erase(q))
++				goto not_supported;
++			break;
++		case REQ_OP_WRITE_SAME:
++			if (!q->limits.max_write_same_sectors)
++				goto not_supported;
++			break;
++		case REQ_OP_ZONE_APPEND:
++			status = blk_check_zone_append(q, bio);
++			if (status != BLK_STS_OK)
++				goto end_io;
++			break;
++		case REQ_OP_ZONE_RESET:
++		case REQ_OP_ZONE_OPEN:
++		case REQ_OP_ZONE_CLOSE:
++		case REQ_OP_ZONE_FINISH:
++			if (!blk_queue_is_zoned(q))
++				goto not_supported;
++			break;
++		case REQ_OP_ZONE_RESET_ALL:
++			if (!blk_queue_is_zoned(q) || !blk_queue_zone_resetall(q))
++				goto not_supported;
++			break;
++		case REQ_OP_WRITE_ZEROES:
++			if (!q->limits.max_write_zeroes_sectors)
++				goto not_supported;
++			break;
++		default:
++			break;
++		}
+ 	}
+ 
+ 	if (blk_throtl_bio(bio))
+-- 
+2.35.1
+
+
+From 6eac27391b4b3fb57e9d8935f1d96b02ffb535d9 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 12 Oct 2021 07:15:13 -0600
+Subject: [PATCH 03/15] net: decouple skb_frag_t from struct bio_vec
+
+There are some hidden dependencies between the size of skb_frag_t, and
+hence also struct bio_vec, which causes network data corruption when
+the bio_vec is changed. This is at least true on igb, unsure how many
+drivers it affects or if it's a core feature that igb just happens to
+use.
+
+Since nothing ever came of the skb_frag_t and bio_vec unification, just
+add a private skb_frag_struct instead that has the same layout as the
+bio_vec.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ include/linux/skbuff.h | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 8a636e678902..64bd2eac5992 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -342,7 +342,19 @@ extern int sysctl_max_skb_frags;
+  */
+ #define GSO_BY_FRAGS	0xFFFF
+ 
+-typedef struct bio_vec skb_frag_t;
++struct skb_frag_struct {
++	struct page	*bv_page;
++	unsigned int	bv_len;
++	unsigned int	bv_offset;
++};
++
++/*
++ * This used to be typedef'ed to bio_vec, but changing bio_vec seemingly
++ * breaks some networking drivers (igb at least). Use our own struct for
++ * now, as it doesn't seem like anything ever came of the unification
++ * between skb frags and bio_vecs.
++ */
++typedef struct skb_frag_struct skb_frag_t;
+ 
+ /**
+  * skb_frag_size() - Returns the size of a skb fragment
+-- 
+2.35.1
+
+
+From 10f66d56950018411a965044d798b693c17a4df6 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 12 Oct 2021 10:07:35 -0600
+Subject: [PATCH 04/15] block: add bvec_set_page() helper
+
+Instead of opencoding this everywhere, add a helper that can initialize
+a bio_vec page/length/offset members.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ block/bio-integrity.c             |  4 +---
+ block/bio.c                       |  8 ++------
+ block/blk-lib.c                   |  5 ++---
+ drivers/block/virtio_blk.c        |  5 ++---
+ drivers/block/zram/zram_drv.c     | 16 ++++------------
+ drivers/md/bcache/util.c          | 22 +++++++++++++---------
+ drivers/md/dm-log-writes.c        |  3 +--
+ drivers/nvme/host/core.c          |  5 ++---
+ drivers/nvme/target/io-cmd-file.c |  4 +---
+ drivers/scsi/sd.c                 |  8 ++++----
+ drivers/target/target_core_file.c | 18 ++++++------------
+ drivers/vhost/vringh.c            |  5 ++---
+ fs/afs/write.c                    |  4 +---
+ fs/ceph/file.c                    |  9 ++++-----
+ fs/cifs/connect.c                 |  4 ++--
+ fs/cifs/misc.c                    |  5 ++---
+ fs/cifs/smb2ops.c                 |  6 +++---
+ fs/cifs/transport.c               |  6 +++---
+ fs/io_uring.c                     |  4 +---
+ fs/orangefs/inode.c               | 17 +++++++----------
+ fs/splice.c                       |  5 ++---
+ include/linux/bvec.h              |  8 ++++++++
+ 22 files changed, 73 insertions(+), 98 deletions(-)
+
+diff --git a/block/bio-integrity.c b/block/bio-integrity.c
+index 0827b19820c5..09482ec7d6fc 100644
+--- a/block/bio-integrity.c
++++ b/block/bio-integrity.c
+@@ -138,9 +138,7 @@ int bio_integrity_add_page(struct bio *bio, struct page *page,
+ 			     &bip->bip_vec[bip->bip_vcnt - 1], offset))
+ 		return 0;
+ 
+-	iv->bv_page = page;
+-	iv->bv_len = len;
+-	iv->bv_offset = offset;
++	bvec_set_page(iv, page, len, offset);
+ 	bip->bip_vcnt++;
+ 
+ 	return len;
+diff --git a/block/bio.c b/block/bio.c
+index 4312a8085396..dd8e37f61999 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -917,9 +917,7 @@ int bio_add_hw_page(struct request_queue *q, struct bio *bio,
+ 		return 0;
+ 
+ 	bvec = &bio->bi_io_vec[bio->bi_vcnt];
+-	bvec->bv_page = page;
+-	bvec->bv_len = len;
+-	bvec->bv_offset = offset;
++	bvec_set_page(bvec, page, len, offset);
+ 	bio->bi_vcnt++;
+ 	bio->bi_iter.bi_size += len;
+ 	return len;
+@@ -1000,9 +998,7 @@ void __bio_add_page(struct bio *bio, struct page *page,
+ 	WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED));
+ 	WARN_ON_ONCE(bio_full(bio, len));
+ 
+-	bv->bv_page = page;
+-	bv->bv_offset = off;
+-	bv->bv_len = len;
++	bvec_set_page(bv, page, len, off);
+ 
+ 	bio->bi_iter.bi_size += len;
+ 	bio->bi_vcnt++;
+diff --git a/block/blk-lib.c b/block/blk-lib.c
+index 9f09beadcbe3..bfe4b223e149 100644
+--- a/block/blk-lib.c
++++ b/block/blk-lib.c
+@@ -193,9 +193,8 @@ static int __blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
+ 		bio->bi_iter.bi_sector = sector;
+ 		bio_set_dev(bio, bdev);
+ 		bio->bi_vcnt = 1;
+-		bio->bi_io_vec->bv_page = page;
+-		bio->bi_io_vec->bv_offset = 0;
+-		bio->bi_io_vec->bv_len = bdev_logical_block_size(bdev);
++		bvec_set_page(bio->bi_io_vec, page,
++				bdev_logical_block_size(bdev), 0);
+ 		bio_set_op_attrs(bio, REQ_OP_WRITE_SAME, 0);
+ 
+ 		if (nr_sects > max_write_same_sectors) {
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 8c415be86732..2ffe763af154 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -165,9 +165,8 @@ static int virtblk_setup_discard_write_zeroes(struct request *req, bool unmap)
+ 
+ 	WARN_ON_ONCE(n != segments);
+ 
+-	req->special_vec.bv_page = virt_to_page(range);
+-	req->special_vec.bv_offset = offset_in_page(range);
+-	req->special_vec.bv_len = sizeof(*range) * segments;
++	bvec_set_page(&req->special_vec, virt_to_page(range),
++			sizeof(*range) * segments, offset_in_page(range));
+ 	req->rq_flags |= RQF_SPECIAL_PAYLOAD;
+ 
+ 	return 0;
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index cb253d80d72b..1e97b5d56194 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -696,9 +696,7 @@ static ssize_t writeback_store(struct device *dev,
+ 	for (; nr_pages != 0; index++, nr_pages--) {
+ 		struct bio_vec bvec;
+ 
+-		bvec.bv_page = page;
+-		bvec.bv_len = PAGE_SIZE;
+-		bvec.bv_offset = 0;
++		bvec_set_page(&bvec, page, PAGE_SIZE, 0);
+ 
+ 		spin_lock(&zram->wb_limit_lock);
+ 		if (zram->wb_limit_enable && !zram->bd_wb_limit) {
+@@ -1269,9 +1267,7 @@ static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
+ 
+ 		zram_slot_unlock(zram, index);
+ 
+-		bvec.bv_page = page;
+-		bvec.bv_len = PAGE_SIZE;
+-		bvec.bv_offset = 0;
++		bvec_set_page(&bvec, page, PAGE_SIZE, 0);
+ 		return read_from_bdev(zram, &bvec,
+ 				zram_get_element(zram, index),
+ 				bio, partial_io);
+@@ -1496,9 +1492,7 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+ 		kunmap_atomic(dst);
+ 		kunmap_atomic(src);
+ 
+-		vec.bv_page = page;
+-		vec.bv_len = PAGE_SIZE;
+-		vec.bv_offset = 0;
++		bvec_set_page(&vec, page, PAGE_SIZE, 0);
+ 	}
+ 
+ 	ret = __zram_bvec_write(zram, &vec, index, bio);
+@@ -1681,9 +1675,7 @@ static int zram_rw_page(struct block_device *bdev, sector_t sector,
+ 	index = sector >> SECTORS_PER_PAGE_SHIFT;
+ 	offset = (sector & (SECTORS_PER_PAGE - 1)) << SECTOR_SHIFT;
+ 
+-	bv.bv_page = page;
+-	bv.bv_len = PAGE_SIZE;
+-	bv.bv_offset = 0;
++	bvec_set_page(&bv, page, PAGE_SIZE, 0);
+ 
+ 	start_time = disk_start_io_acct(bdev->bd_disk, SECTORS_PER_PAGE, op);
+ 	ret = zram_bvec_rw(zram, &bv, index, offset, op, NULL);
+diff --git a/drivers/md/bcache/util.c b/drivers/md/bcache/util.c
+index ae380bc3992e..588e67619210 100644
+--- a/drivers/md/bcache/util.c
++++ b/drivers/md/bcache/util.c
+@@ -232,26 +232,29 @@ void bch_bio_map(struct bio *bio, void *base)
+ {
+ 	size_t size = bio->bi_iter.bi_size;
+ 	struct bio_vec *bv = bio->bi_io_vec;
++	unsigned int len, offset;
++	struct page *page;
+ 
+ 	BUG_ON(!bio->bi_iter.bi_size);
+ 	BUG_ON(bio->bi_vcnt);
+ 
+-	bv->bv_offset = base ? offset_in_page(base) : 0;
++	offset = base ? offset_in_page(base) : 0;
+ 	goto start;
+ 
+ 	for (; size; bio->bi_vcnt++, bv++) {
+-		bv->bv_offset	= 0;
+-start:		bv->bv_len	= min_t(size_t, PAGE_SIZE - bv->bv_offset,
+-					size);
++		offset		= 0;
++start:
++		len		= min_t(size_t, PAGE_SIZE - offset, size);
+ 		if (base) {
+-			bv->bv_page = is_vmalloc_addr(base)
++			page = is_vmalloc_addr(base)
+ 				? vmalloc_to_page(base)
+ 				: virt_to_page(base);
+ 
+-			base += bv->bv_len;
++			base += len;
+ 		}
+ 
+-		size -= bv->bv_len;
++		bvec_set_page(bv, page, len, offset);
++		size -= len;
+ 	}
+ }
+ 
+@@ -275,12 +278,13 @@ int bch_bio_alloc_pages(struct bio *bio, gfp_t gfp_mask)
+ 	 * bvec table directly.
+ 	 */
+ 	for (i = 0, bv = bio->bi_io_vec; i < bio->bi_vcnt; bv++, i++) {
+-		bv->bv_page = alloc_page(gfp_mask);
+-		if (!bv->bv_page) {
++		struct page *page = alloc_page(gfp_mask);
++		if (page) {
+ 			while (--bv >= bio->bi_io_vec)
+ 				__free_page(bv->bv_page);
+ 			return -ENOMEM;
+ 		}
++		bvec_set_page(bv, page, 0, 0);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/md/dm-log-writes.c b/drivers/md/dm-log-writes.c
+index 139b09b06eda..92b65738c2d7 100644
+--- a/drivers/md/dm-log-writes.c
++++ b/drivers/md/dm-log-writes.c
+@@ -768,8 +768,7 @@ static int log_writes_map(struct dm_target *ti, struct bio *bio)
+ 		dst = kmap_atomic(page);
+ 		memcpy_from_bvec(dst, &bv);
+ 		kunmap_atomic(dst);
+-		block->vecs[i].bv_page = page;
+-		block->vecs[i].bv_len = bv.bv_len;
++		bvec_set_page(&block->vecs[i], page, bv.bv_len, 0);
+ 		block->vec_cnt++;
+ 		i++;
+ 	}
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index fd4720d37cc0..ff536c7cda25 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -875,9 +875,8 @@ static blk_status_t nvme_setup_discard(struct nvme_ns *ns, struct request *req,
+ 	cmnd->dsm.nr = cpu_to_le32(segments - 1);
+ 	cmnd->dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
+ 
+-	req->special_vec.bv_page = virt_to_page(range);
+-	req->special_vec.bv_offset = offset_in_page(range);
+-	req->special_vec.bv_len = alloc_size;
++	bvec_set_page(&req->special_vec, virt_to_page(range), alloc_size,
++			offset_in_page(range));
+ 	req->rq_flags |= RQF_SPECIAL_PAYLOAD;
+ 
+ 	return BLK_STS_OK;
+diff --git a/drivers/nvme/target/io-cmd-file.c b/drivers/nvme/target/io-cmd-file.c
+index 6be6e59d273b..9e0ccb5cee16 100644
+--- a/drivers/nvme/target/io-cmd-file.c
++++ b/drivers/nvme/target/io-cmd-file.c
+@@ -94,9 +94,7 @@ int nvmet_file_ns_enable(struct nvmet_ns *ns)
+ 
+ static void nvmet_file_init_bvec(struct bio_vec *bv, struct scatterlist *sg)
+ {
+-	bv->bv_page = sg_page(sg);
+-	bv->bv_offset = sg->offset;
+-	bv->bv_len = sg->length;
++	bvec_set_page(bv, sg_page(sg), sg->length, sg->offset);
+ }
+ 
+ static ssize_t nvmet_file_submit_bvec(struct nvmet_req *req, loff_t pos,
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 62eb9921cc94..0d369a2890c2 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -875,14 +875,14 @@ static blk_status_t sd_setup_unmap_cmnd(struct scsi_cmnd *cmd)
+ 	u64 lba = sectors_to_logical(sdp, blk_rq_pos(rq));
+ 	u32 nr_blocks = sectors_to_logical(sdp, blk_rq_sectors(rq));
+ 	unsigned int data_len = 24;
++	struct page *page;
+ 	char *buf;
+ 
+-	rq->special_vec.bv_page = mempool_alloc(sd_page_pool, GFP_ATOMIC);
+-	if (!rq->special_vec.bv_page)
++	page = mempool_alloc(sd_page_pool, GFP_ATOMIC);
++	if (page)
+ 		return BLK_STS_RESOURCE;
+ 	clear_highpage(rq->special_vec.bv_page);
+-	rq->special_vec.bv_offset = 0;
+-	rq->special_vec.bv_len = data_len;
++	bvec_set_page(&rq->special_vec, page, data_len, 0);
+ 	rq->rq_flags |= RQF_SPECIAL_PAYLOAD;
+ 
+ 	cmd->cmd_len = 10;
+diff --git a/drivers/target/target_core_file.c b/drivers/target/target_core_file.c
+index 8190b840065f..968ace2ddf64 100644
+--- a/drivers/target/target_core_file.c
++++ b/drivers/target/target_core_file.c
+@@ -278,10 +278,8 @@ fd_execute_rw_aio(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
+ 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ 
+ 	for_each_sg(sgl, sg, sgl_nents, i) {
+-		aio_cmd->bvecs[i].bv_page = sg_page(sg);
+-		aio_cmd->bvecs[i].bv_len = sg->length;
+-		aio_cmd->bvecs[i].bv_offset = sg->offset;
+-
++		bvec_set_page(&aio_cmd->bvecs[i], sg_page(sg), sg->length,
++				sg->offset);
+ 		len += sg->length;
+ 	}
+ 
+@@ -326,10 +324,7 @@ static int fd_do_rw(struct se_cmd *cmd, struct file *fd,
+ 	}
+ 
+ 	for_each_sg(sgl, sg, sgl_nents, i) {
+-		bvec[i].bv_page = sg_page(sg);
+-		bvec[i].bv_len = sg->length;
+-		bvec[i].bv_offset = sg->offset;
+-
++		bvec_set_page(&bvec[i], sg_page(sg), sg->length, sg->offset);
+ 		len += sg->length;
+ 	}
+ 
+@@ -463,10 +458,9 @@ fd_execute_write_same(struct se_cmd *cmd)
+ 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ 
+ 	for (i = 0; i < nolb; i++) {
+-		bvec[i].bv_page = sg_page(&cmd->t_data_sg[0]);
+-		bvec[i].bv_len = cmd->t_data_sg[0].length;
+-		bvec[i].bv_offset = cmd->t_data_sg[0].offset;
+-
++		bvec_set_page(&bvec[i], sg_page(&cmd->t_data_sg[0]),
++				cmd->t_data_sg[0].length,
++				cmd->t_data_sg[0].offset);
+ 		len += se_dev->dev_attrib.block_size;
+ 	}
+ 
+diff --git a/drivers/vhost/vringh.c b/drivers/vhost/vringh.c
+index 14e2043d7685..5be00553a876 100644
+--- a/drivers/vhost/vringh.c
++++ b/drivers/vhost/vringh.c
+@@ -1120,9 +1120,8 @@ static int iotlb_translate(const struct vringh *vrh,
+ 		size = map->size - addr + map->start;
+ 		pa = map->addr + addr - map->start;
+ 		pfn = pa >> PAGE_SHIFT;
+-		iov[ret].bv_page = pfn_to_page(pfn);
+-		iov[ret].bv_len = min(len - s, size);
+-		iov[ret].bv_offset = pa & (PAGE_SIZE - 1);
++		bvec_set_page(&iov[ret], pfn_to_page(pfn), min(len - s, size),
++				pa & (PAGE_SIZE - 1));
+ 		s += size;
+ 		addr += size;
+ 		++ret;
+diff --git a/fs/afs/write.c b/fs/afs/write.c
+index f447c902318d..34293e8e498b 100644
+--- a/fs/afs/write.c
++++ b/fs/afs/write.c
+@@ -1000,9 +1000,7 @@ int afs_launder_page(struct page *subpage)
+ 			t = afs_folio_dirty_to(folio, priv);
+ 		}
+ 
+-		bv[0].bv_page = &folio->page;
+-		bv[0].bv_offset = f;
+-		bv[0].bv_len = t - f;
++		bvec_set_page(&bv[0], &folio->page, t - f, f);
+ 		iov_iter_bvec(&iter, WRITE, bv, 1, bv[0].bv_len);
+ 
+ 		trace_afs_folio_dirty(vnode, tracepoint_string("launder"), folio);
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index bbed3224ad68..116a9dc6c0d2 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -104,12 +104,11 @@ static ssize_t __iter_get_bvecs(struct iov_iter *iter, size_t maxsize,
+ 		size += bytes;
+ 
+ 		for ( ; bytes; idx++, bvec_idx++) {
+-			struct bio_vec bv = {
+-				.bv_page = pages[idx],
+-				.bv_len = min_t(int, bytes, PAGE_SIZE - start),
+-				.bv_offset = start,
+-			};
++			struct bio_vec bv;
+ 
++			bvec_set_page(&bv, pages[idx],
++					min_t(int, bytes, PAGE_SIZE - start),
++					start);
+ 			bvecs[bvec_idx] = bv;
+ 			bytes -= bv.bv_len;
+ 			start = 0;
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index d3020abfe404..0e274218c5bc 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -708,8 +708,8 @@ cifs_read_page_from_socket(struct TCP_Server_Info *server, struct page *page,
+ 	unsigned int page_offset, unsigned int to_read)
+ {
+ 	struct msghdr smb_msg;
+-	struct bio_vec bv = {
+-		.bv_page = page, .bv_len = to_read, .bv_offset = page_offset};
++	struct bio_vec bv;
++	bvec_set_page(&bv, page, to_read, page_offset);
+ 	iov_iter_bvec(&smb_msg.msg_iter, READ, &bv, 1, to_read);
+ 	return cifs_readv_from_socket(server, &smb_msg);
+ }
+diff --git a/fs/cifs/misc.c b/fs/cifs/misc.c
+index 56598f7dbe00..b6d0b4144e6f 100644
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@ -1046,9 +1046,8 @@ setup_aio_ctx_iter(struct cifs_aio_ctx *ctx, struct iov_iter *iter, int rw)
+ 
+ 		for (i = 0; i < cur_npages; i++) {
+ 			len = rc > PAGE_SIZE ? PAGE_SIZE : rc;
+-			bv[npages + i].bv_page = pages[i];
+-			bv[npages + i].bv_offset = start;
+-			bv[npages + i].bv_len = len - start;
++			bvec_set_page(&bv[npages + i], pages[i], len - start,
++					start);
+ 			rc -= len;
+ 			start = 0;
+ 		}
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index af5d0830bc8a..d9dbeefa07ee 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -4776,9 +4776,9 @@ init_read_bvec(struct page **pages, unsigned int npages, unsigned int data_size,
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < npages; i++) {
+-		bvec[i].bv_page = pages[i];
+-		bvec[i].bv_offset = (i == 0) ? cur_off : 0;
+-		bvec[i].bv_len = min_t(unsigned int, PAGE_SIZE, data_size);
++		bvec_set_page(&bvec[i], pages[i],
++				min_t(unsigned int, PAGE_SIZE, data_size),
++				(i == 0) ? cur_off : 0);
+ 		data_size -= bvec[i].bv_len;
+ 	}
+ 
+diff --git a/fs/cifs/transport.c b/fs/cifs/transport.c
+index a4c3e027cca2..eec1365f71dd 100644
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@ -384,11 +384,11 @@ __smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
+ 
+ 		/* now walk the page array and send each page in it */
+ 		for (i = 0; i < rqst[j].rq_npages; i++) {
++			unsigned int len, offset;
+ 			struct bio_vec bvec;
+ 
+-			bvec.bv_page = rqst[j].rq_pages[i];
+-			rqst_page_get_length(&rqst[j], i, &bvec.bv_len,
+-					     &bvec.bv_offset);
++			rqst_page_get_length(&rqst[j], i, &len, &offset);
++			bvec_set_page(&bvec, rqst[j].rq_pages[i], len, offset);
+ 
+ 			iov_iter_bvec(&smb_msg.msg_iter, WRITE,
+ 				      &bvec, 1, bvec.bv_len);
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 4715980e9015..2fc144ede7ee 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -9197,9 +9197,7 @@ static int io_sqe_buffer_register(struct io_ring_ctx *ctx, struct iovec *iov,
+ 		size_t vec_len;
+ 
+ 		vec_len = min_t(size_t, size, PAGE_SIZE - off);
+-		imu->bvec[i].bv_page = pages[i];
+-		imu->bvec[i].bv_len = vec_len;
+-		imu->bvec[i].bv_offset = off;
++		bvec_set_page(&imu->bvec[i], pages[i], vec_len, off);
+ 		off = 0;
+ 		size -= vec_len;
+ 	}
+diff --git a/fs/orangefs/inode.c b/fs/orangefs/inode.c
+index e5e3e500ed46..e8a1d0adb8af 100644
+--- a/fs/orangefs/inode.c
++++ b/fs/orangefs/inode.c
+@@ -49,9 +49,7 @@ static int orangefs_writepage_locked(struct page *page,
+ 	/* Should've been handled in orangefs_invalidatepage. */
+ 	WARN_ON(off == len || off + wlen > len);
+ 
+-	bv.bv_page = page;
+-	bv.bv_len = wlen;
+-	bv.bv_offset = off % PAGE_SIZE;
++	bvec_set_page(&bv, page, wlen, off % PAGE_SIZE);
+ 	WARN_ON(wlen == 0);
+ 	iov_iter_bvec(&iter, WRITE, &bv, 1, wlen);
+ 
+@@ -101,16 +99,17 @@ static int orangefs_writepages_work(struct orangefs_writepages *ow,
+ 	len = i_size_read(inode);
+ 
+ 	for (i = 0; i < ow->npages; i++) {
++		unsigned int off, len;
+ 		set_page_writeback(ow->pages[i]);
+ 		ow->bv[i].bv_page = ow->pages[i];
+-		ow->bv[i].bv_len = min(page_offset(ow->pages[i]) + PAGE_SIZE,
++		len = min(page_offset(ow->pages[i]) + PAGE_SIZE,
+ 		    ow->off + ow->len) -
+ 		    max(ow->off, page_offset(ow->pages[i]));
+ 		if (i == 0)
+-			ow->bv[i].bv_offset = ow->off -
+-			    page_offset(ow->pages[i]);
++			off = ow->off - page_offset(ow->pages[i]);
+ 		else
+-			ow->bv[i].bv_offset = 0;
++			off = 0;
++		bvec_set_page(&ow->bv[i], ow->pages[i], len, off);
+ 	}
+ 	iov_iter_bvec(&iter, WRITE, ow->bv, ow->npages, ow->len);
+ 
+@@ -300,9 +299,7 @@ static int orangefs_readpage(struct file *file, struct page *page)
+ 		orangefs_launder_page(page);
+ 
+ 	off = page_offset(page);
+-	bv.bv_page = page;
+-	bv.bv_len = PAGE_SIZE;
+-	bv.bv_offset = 0;
++	bvec_set_page(&bv, page, PAGE_SIZE, 0);
+ 	iov_iter_bvec(&iter, READ, &bv, 1, PAGE_SIZE);
+ 
+ 	ret = wait_for_direct_io(ORANGEFS_IO_READ, inode, &off, &iter,
+diff --git a/fs/splice.c b/fs/splice.c
+index 5dbce4dcc1a7..142b299c4bc8 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -678,9 +678,8 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 				goto done;
+ 			}
+ 
+-			array[n].bv_page = buf->page;
+-			array[n].bv_len = this_len;
+-			array[n].bv_offset = buf->offset;
++			bvec_set_page(&array[n], buf->page, this_len,
++					buf->offset);
+ 			left -= this_len;
+ 			n++;
+ 		}
+diff --git a/include/linux/bvec.h b/include/linux/bvec.h
+index 35c25dff651a..01110942b6f9 100644
+--- a/include/linux/bvec.h
++++ b/include/linux/bvec.h
+@@ -241,4 +241,12 @@ static inline void *bvec_virt(struct bio_vec *bvec)
+ 	return page_address(bvec->bv_page) + bvec->bv_offset;
+ }
+ 
++static inline void bvec_set_page(struct bio_vec *bv, struct page *page,
++				 unsigned int len, unsigned int offset)
++{
++	bv->bv_page = page;
++	bv->bv_len = len;
++	bv->bv_offset = offset;
++}
++
+ #endif /* __LINUX_BVEC_H */
+-- 
+2.35.1
+
+
+From 7a5dad20df497e024e201cc8c73b91a0a5769a03 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 12 Oct 2021 07:17:44 -0600
+Subject: [PATCH 05/15] block: add a DMA field to struct bio_vec
+
+Allows the caller to pass in a fully prepared bvec that has already
+been mapped by the driver. This can save a DMAP map+unmap per IO.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ include/linux/bvec.h | 44 +++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bvec.h b/include/linux/bvec.h
+index 01110942b6f9..69cb019b4ab2 100644
+--- a/include/linux/bvec.h
++++ b/include/linux/bvec.h
+@@ -22,6 +22,7 @@ struct page;
+  * @bv_page:   First page associated with the address range.
+  * @bv_len:    Number of bytes in the address range.
+  * @bv_offset: Start of the address range relative to the start of @bv_page.
++ * @bv_dma_start: If page is already DMA mapped, holds start DMA address.
+  *
+  * The following holds for a bvec if n * PAGE_SIZE < bv_offset + bv_len:
+  *
+@@ -33,6 +34,9 @@ struct bio_vec {
+ 	struct page	*bv_page;
+ 	unsigned int	bv_len;
+ 	unsigned int	bv_offset;
++#ifdef CONFIG_HAS_DMA
++	dma_addr_t	bv_dma_start;
++#endif
+ };
+ 
+ struct bvec_iter {
+@@ -69,15 +73,28 @@ struct bvec_iter_all {
+ #define mp_bvec_iter_offset(bvec, iter)				\
+ 	(__bvec_iter_bvec((bvec), (iter))->bv_offset + (iter).bi_bvec_done)
+ 
++#define mp_bvec_iter_dma_start(bvec, iter)			\
++	(__bvec_iter_bvec((bvec), (iter))->bv_dma_start)
++
+ #define mp_bvec_iter_page_idx(bvec, iter)			\
+ 	(mp_bvec_iter_offset((bvec), (iter)) / PAGE_SIZE)
+ 
+-#define mp_bvec_iter_bvec(bvec, iter)				\
+-((struct bio_vec) {						\
+-	.bv_page	= mp_bvec_iter_page((bvec), (iter)),	\
+-	.bv_len		= mp_bvec_iter_len((bvec), (iter)),	\
+-	.bv_offset	= mp_bvec_iter_offset((bvec), (iter)),	\
++#ifdef CONFIG_HAS_DMA
++#define mp_bvec_iter_bvec(bvec, iter)					\
++((struct bio_vec) {							\
++	.bv_page	= mp_bvec_iter_page((bvec), (iter)),		\
++	.bv_len		= mp_bvec_iter_len((bvec), (iter)),		\
++	.bv_offset	= mp_bvec_iter_offset((bvec), (iter)),		\
++	.bv_dma_start	= mp_bvec_iter_dma_start((bvec), (iter)),	\
++})
++#else
++#define mp_bvec_iter_bvec(bvec, iter)					\
++((struct bio_vec) {							\
++	.bv_page	= mp_bvec_iter_page((bvec), (iter)),		\
++	.bv_len		= mp_bvec_iter_len((bvec), (iter)),		\
++	.bv_offset	= mp_bvec_iter_offset((bvec), (iter)),		\
+ })
++#endif
+ 
+ /* For building single-page bvec in flight */
+  #define bvec_iter_offset(bvec, iter)				\
+@@ -91,12 +108,26 @@ struct bvec_iter_all {
+ 	(mp_bvec_iter_page((bvec), (iter)) +			\
+ 	 mp_bvec_iter_page_idx((bvec), (iter)))
+ 
++#define bvec_iter_dma_start(bvec, iter)				\
++	min_t(unsigned, mp_bvec_iter_dma_start((bvec), (iter)),	\
++	      PAGE_SIZE - bvec_iter_offset((bvec), (iter)))
++
++#ifdef CONFIG_HAS_DMA
++#define bvec_iter_bvec(bvec, iter)				\
++((struct bio_vec) {						\
++	.bv_page	= bvec_iter_page((bvec), (iter)),	\
++	.bv_len		= bvec_iter_len((bvec), (iter)),	\
++	.bv_offset	= bvec_iter_offset((bvec), (iter)),	\
++	.bv_dma_start	= bvec_iter_dma_start((bvec), (iter)),	\
++})
++#else
+ #define bvec_iter_bvec(bvec, iter)				\
+ ((struct bio_vec) {						\
+ 	.bv_page	= bvec_iter_page((bvec), (iter)),	\
+ 	.bv_len		= bvec_iter_len((bvec), (iter)),	\
+ 	.bv_offset	= bvec_iter_offset((bvec), (iter)),	\
+ })
++#endif
+ 
+ static inline bool bvec_iter_advance(const struct bio_vec *bv,
+ 		struct bvec_iter *iter, unsigned bytes)
+@@ -247,6 +278,9 @@ static inline void bvec_set_page(struct bio_vec *bv, struct page *page,
+ 	bv->bv_page = page;
+ 	bv->bv_len = len;
+ 	bv->bv_offset = offset;
++#ifdef CONFIG_HAS_DMA
++	bv->bv_dma_start = 0;
++#endif
+ }
+ 
+ #endif /* __LINUX_BVEC_H */
+-- 
+2.35.1
+
+
+From 60fbfd4cee81e3663ff5e99458b642642fdb410c Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 12 Oct 2021 07:19:08 -0600
+Subject: [PATCH 06/15] block: add mq_ops method for DMA mapping bvecs
+
+Add a way for a driver to DMA map an array of bvecs, and return the
+device to which it was mapped. This goes along with a set of block
+helpers for mapping and unmapping.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ block/bdev.c           | 34 ++++++++++++++++++++++++++++++++++
+ include/linux/blk-mq.h |  4 ++++
+ include/linux/blkdev.h |  5 +++++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/block/bdev.c b/block/bdev.c
+index 102837a37051..766d126642f9 100644
+--- a/block/bdev.c
++++ b/block/bdev.c
+@@ -26,6 +26,7 @@
+ #include <linux/namei.h>
+ #include <linux/part_stat.h>
+ #include <linux/uaccess.h>
++#include <linux/dma-mapping.h>
+ #include "../fs/internal.h"
+ #include "blk.h"
+ 
+@@ -1061,3 +1062,36 @@ void sync_bdevs(bool wait)
+ 	spin_unlock(&blockdev_superblock->s_inode_list_lock);
+ 	iput(old_inode);
+ }
++
++/*
++ * Returns device on success, which is used for unmapping the range as well.
++ * The ->dma_map() helper must grab a reference to the device, the block
++ * unmap helper will drop that reference again.
++ */
++struct device *block_dma_map_bvec(struct block_device *bdev,
++				  struct bio_vec *bvec, int nr_vecs)
++{
++#ifdef CONFIG_HAS_DMA
++	struct request_queue *q = bdev_get_queue(bdev);
++
++	if (q->mq_ops && q->mq_ops->dma_map)
++		return q->mq_ops->dma_map(q, bvec, nr_vecs, 0);
++	return ERR_PTR(-EINVAL);
++#else
++	return ERR_PTR(-EOPNOTSUPP);
++#endif
++}
++
++void block_dma_unmap_bvec(struct device *dev, struct bio_vec *bvec, int nr_vecs)
++{
++#ifdef CONFIG_HAS_DMA
++	int i;
++
++	for (i = 0; i < nr_vecs; i++) {
++		dma_unmap_page(dev, bvec->bv_dma_start, bvec->bv_len, 0);
++		bvec++;
++	}
++
++	put_device(dev);
++#endif
++}
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index d319ffa59354..f9f7b51bc9ca 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -637,6 +637,10 @@ struct blk_mq_ops {
+ 	 */
+ 	void (*show_rq)(struct seq_file *m, struct request *rq);
+ #endif
++#ifdef CONFIG_HAS_DMA
++	struct device *(*dma_map)(struct request_queue *, struct bio_vec *,
++					int nr_vecs, int);
++#endif
+ };
+ 
+ enum {
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 16b47035e4b0..ef26f5b270c3 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1333,6 +1333,11 @@ int fsync_bdev(struct block_device *bdev);
+ int freeze_bdev(struct block_device *bdev);
+ int thaw_bdev(struct block_device *bdev);
+ 
++struct device *block_dma_map_bvec(struct block_device *bdev,
++					struct bio_vec *bvec, int nr_vecs);
++void block_dma_unmap_bvec(struct device *dev, struct bio_vec *bvec,
++				int nr_vecs);
++
+ struct io_comp_batch {
+ 	struct request *req_list;
+ 	bool need_ts;
+-- 
+2.35.1
+
+
+From d5b8c6aeaa017d388baa4b13bd2125820253a886 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 12 Oct 2021 07:19:44 -0600
+Subject: [PATCH 07/15] io_uring: add IORING_REGISTER_{MAP,UNMAP}_BUFFERS
+
+If supported by the file used for IO, pre-map registered buffers for
+DMA. This ties in with registered buffers, and this is only feasible
+on a range of buffers that have been registered with
+IORING_REGISTER_BUFFERS or IORING_REGISTER_BUFFERS2.
+
+By pre-mapping the buffers for DMA, we retain any DMA mappings across
+IO. This means that we no longer have to do a DMA map+unmap for each
+IO.
+
+The buffers can be unmapped with IORING_REGISTER_UNMAP_BUFFERS, or
+simply just unregistered as per usual and unmapping will happen as
+part of that.
+
+This goes for updates through IORING_REGISTER_BUFFERS_UPDATE as well,
+if the existing buffer being replaced is DMA mapped, it is unmapped
+as part of the update. The new buffer must be DMA mapped afterwards,
+if so desired.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ fs/io_uring.c                 | 131 ++++++++++++++++++++++++++++++++++
+ include/uapi/linux/io_uring.h |  12 ++++
+ 2 files changed, 143 insertions(+)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 2fc144ede7ee..0bb57100dbc8 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -212,6 +212,9 @@ struct io_mapped_ubuf {
+ 	u64		ubuf_end;
+ 	unsigned int	nr_bvecs;
+ 	unsigned long	acct_pages;
++#ifdef CONFIG_BLOCK
++	struct device	*dev;
++#endif
+ 	struct bio_vec	bvec[];
+ };
+ 
+@@ -8976,6 +8979,117 @@ static unsigned long rings_size(unsigned sq_entries, unsigned cq_entries,
+ 	return off;
+ }
+ 
++#ifdef CONFIG_BLOCK
++static int get_map_range(struct io_ring_ctx *ctx,
++			 struct io_uring_map_buffers *map, void __user *arg)
++{
++	int ret;
++
++	if (copy_from_user(map, arg, sizeof(*map)))
++		return -EFAULT;
++	if (map->flags || map->rsvd[0] || map->rsvd[1])
++		return -EINVAL;
++	if (map->buf_start >= ctx->nr_user_bufs)
++		return -EINVAL;
++	if (map->buf_end > ctx->nr_user_bufs)
++		map->buf_end = ctx->nr_user_bufs;
++	ret = map->buf_end - map->buf_start;
++	if (ret <= 0)
++		return -EINVAL;
++	return ret;
++}
++
++static void io_dma_unmap_bvec(struct io_mapped_ubuf *imu)
++{
++	if (!imu->dev)
++		return;
++
++	block_dma_unmap_bvec(imu->dev, imu->bvec, imu->nr_bvecs);
++	imu->dev = NULL;
++}
++
++static int io_register_unmap_buffers(struct io_ring_ctx *ctx, void __user *arg)
++{
++	struct io_uring_map_buffers map;
++	int i, ret;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	ret = get_map_range(ctx, &map, arg);
++	if (ret < 0)
++		return ret;
++
++	for (i = map.buf_start; i < map.buf_end; i++) {
++		struct io_mapped_ubuf *imu = ctx->user_bufs[i];
++
++		io_dma_unmap_bvec(imu);
++	}
++
++	return 0;
++}
++
++static int io_register_map_buffers(struct io_ring_ctx *ctx, void __user *arg)
++{
++	struct io_uring_map_buffers map;
++	struct device *dev;
++	struct block_device *bdev;
++	struct file *file;
++	int ret, i;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	ret = get_map_range(ctx, &map, arg);
++	if (ret < 0)
++		return ret;
++
++	file = fget(map.fd);
++	if (!file)
++		return -EBADF;
++
++	if (S_ISBLK(file_inode(file)->i_mode))
++		bdev = I_BDEV(file->f_mapping->host);
++	else if (S_ISREG(file_inode(file)->i_mode))
++		bdev = file->f_inode->i_sb->s_bdev;
++	else
++		return -EOPNOTSUPP;
++
++	for (i = map.buf_start; i < map.buf_end; i++) {
++		struct io_mapped_ubuf *imu = ctx->user_bufs[i];
++
++		dev = block_dma_map_bvec(bdev, imu->bvec, imu->nr_bvecs);
++		if (IS_ERR(dev)) {
++			ret = PTR_ERR(dev);
++			goto err;
++		}
++		imu->dev = dev;
++	}
++
++	fput(file);
++	return 0;
++err:
++	while (--i >= map.buf_start) {
++		struct io_mapped_ubuf *imu = ctx->user_bufs[i];
++
++		io_dma_unmap_bvec(imu);
++	}
++	fput(file);
++	return ret;
++	return -EOPNOTSUPP;
++}
++#else /* CONFIG_BLOCK */
++static int io_register_map_buffers(struct io_ring_ctx *ctx, void __user *arg)
++{
++	return -EOPNOTSUPP;
++}
++static int io_register_unmap_buffers(struct io_ring_ctx *ctx, void __user *arg)
++{
++	return -EOPNOTSUPP;
++}
++static void io_dma_unmap_bvec(struct io_mapped_ubuf *imu)
++{
++}
++#endif /* CONFIG_BLOCK */
++
+ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf **slot)
+ {
+ 	struct io_mapped_ubuf *imu = *slot;
+@@ -8986,6 +9100,7 @@ static void io_buffer_unmap(struct io_ring_ctx *ctx, struct io_mapped_ubuf **slo
+ 			unpin_user_page(imu->bvec[i].bv_page);
+ 		if (imu->acct_pages)
+ 			io_unaccount_mem(ctx, imu->acct_pages);
++		io_dma_unmap_bvec(imu);
+ 		kvfree(imu);
+ 	}
+ 	*slot = NULL;
+@@ -9205,6 +9320,9 @@ static int io_sqe_buffer_register(struct io_ring_ctx *ctx, struct iovec *iov,
+ 	imu->ubuf = ubuf;
+ 	imu->ubuf_end = ubuf + iov->iov_len;
+ 	imu->nr_bvecs = nr_pages;
++#ifdef CONFIG_BLOCK
++	imu->dev = NULL;
++#endif
+ 	*pimu = imu;
+ 	ret = 0;
+ done:
+@@ -10976,6 +11094,7 @@ static bool io_register_op_must_quiesce(int op)
+ 	case IORING_REGISTER_IOWQ_AFF:
+ 	case IORING_UNREGISTER_IOWQ_AFF:
+ 	case IORING_REGISTER_IOWQ_MAX_WORKERS:
++	case IORING_REGISTER_MAP_BUFFERS:
+ 		return false;
+ 	default:
+ 		return true;
+@@ -11142,6 +11261,18 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
+ 			break;
+ 		ret = io_register_iowq_max_workers(ctx, arg);
+ 		break;
++	case IORING_REGISTER_MAP_BUFFERS:
++		ret = -EINVAL;
++		if (!arg || nr_args != 1)
++			break;
++		ret = io_register_map_buffers(ctx, arg);
++		break;
++	case IORING_REGISTER_UNMAP_BUFFERS:
++		ret = -EINVAL;
++		if (!arg || nr_args != 1)
++			break;
++		ret = io_register_unmap_buffers(ctx, arg);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 		break;
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index 787f491f0d2a..3ddc5a08cff3 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -325,6 +325,10 @@ enum {
+ 	/* set/get max number of io-wq workers */
+ 	IORING_REGISTER_IOWQ_MAX_WORKERS	= 19,
+ 
++	/* dma map registered buffers */
++	IORING_REGISTER_MAP_BUFFERS		= 20,
++	IORING_REGISTER_UNMAP_BUFFERS		= 21,
++
+ 	/* this goes last */
+ 	IORING_REGISTER_LAST
+ };
+@@ -422,4 +426,12 @@ struct io_uring_getevents_arg {
+ 	__u64	ts;
+ };
+ 
++struct io_uring_map_buffers {
++	__s32	fd;
++	__u32	buf_start;
++	__u32	buf_end;
++	__u32	flags;
++	__u64	rsvd[2];
++};
++
+ #endif
+-- 
+2.35.1
+
+
+From 6796dafd3e08c39ec52d666aec15c469325218c4 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 17 Dec 2021 12:33:19 -0700
+Subject: [PATCH 08/15] nvme: use boolean type for iod aborted flag
+
+This is a true/false type of variable, use a boolean rather than a full
+integer.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ drivers/nvme/host/pci.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 6a99ed680915..9e30f6c5472c 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -227,7 +227,7 @@ struct nvme_iod {
+ 	struct nvme_command cmd;
+ 	struct nvme_queue *nvmeq;
+ 	bool use_sgl;
+-	int aborted;
++	bool aborted;
+ 	int npages;		/* In the PRP list. 0 means small pool in use */
+ 	int nents;		/* Used in scatterlist */
+ 	dma_addr_t first_dma;
+@@ -908,7 +908,7 @@ static blk_status_t nvme_prep_rq(struct nvme_dev *dev, struct request *req)
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 	blk_status_t ret;
+ 
+-	iod->aborted = 0;
++	iod->aborted = false;
+ 	iod->npages = -1;
+ 	iod->nents = 0;
+ 
+@@ -1418,7 +1418,7 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
+ 		atomic_inc(&dev->ctrl.abort_limit);
+ 		return BLK_EH_RESET_TIMER;
+ 	}
+-	iod->aborted = 1;
++	iod->aborted = true;
+ 
+ 	cmd.abort.opcode = nvme_admin_abort_cmd;
+ 	cmd.abort.cid = nvme_cid(req);
+-- 
+2.35.1
+
+
+From 141f75314b533a2e27ce702d83b44f81b2928e60 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 17 Dec 2021 12:33:56 -0700
+Subject: [PATCH 09/15] nvme: add support for pre-mapped IO buffers
+
+Normally when an IO comes in, NVMe will DMA map the page(s) and setup
+the PRP or SG list. When IO completes, the mappings are undone. This
+takes time, obviously.
+
+Add support for mapping buffers upfront, by filling in the
+mq_ops->dma_map() handler. The ownership of the mappings goes to the
+caller, and the caller is responsible for tearing them down.
+
+This is good for a ~4% improvement in peak IOPS without an IOMMU,
+much more so with an IOMMU enabled.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ drivers/nvme/host/pci.c | 72 ++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 64 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 9e30f6c5472c..92c5d5284ff4 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -228,6 +228,7 @@ struct nvme_iod {
+ 	struct nvme_queue *nvmeq;
+ 	bool use_sgl;
+ 	bool aborted;
++	bool persistent;
+ 	int npages;		/* In the PRP list. 0 means small pool in use */
+ 	int nents;		/* Used in scatterlist */
+ 	dma_addr_t first_dma;
+@@ -590,8 +591,9 @@ static void nvme_unmap_data(struct nvme_dev *dev, struct request *req)
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 
+ 	if (iod->dma_len) {
+-		dma_unmap_page(dev->dev, iod->first_dma, iod->dma_len,
+-			       rq_dma_dir(req));
++		if (!iod->persistent)
++			dma_unmap_page(dev->dev, iod->first_dma, iod->dma_len,
++				       rq_dma_dir(req));
+ 		return;
+ 	}
+ 
+@@ -805,9 +807,14 @@ static blk_status_t nvme_setup_prp_simple(struct nvme_dev *dev,
+ 	unsigned int offset = bv->bv_offset & (NVME_CTRL_PAGE_SIZE - 1);
+ 	unsigned int first_prp_len = NVME_CTRL_PAGE_SIZE - offset;
+ 
+-	iod->first_dma = dma_map_bvec(dev->dev, bv, rq_dma_dir(req), 0);
+-	if (dma_mapping_error(dev->dev, iod->first_dma))
+-		return BLK_STS_RESOURCE;
++	if (bv->bv_dma_start) {
++		iod->persistent = true;
++		iod->first_dma = bv->bv_dma_start;
++	} else {
++		iod->first_dma = dma_map_bvec(dev->dev, bv, rq_dma_dir(req), 0);
++		if (dma_mapping_error(dev->dev, iod->first_dma))
++			return BLK_STS_RESOURCE;
++	}
+ 	iod->dma_len = bv->bv_len;
+ 
+ 	cmnd->dptr.prp1 = cpu_to_le64(iod->first_dma);
+@@ -822,9 +829,14 @@ static blk_status_t nvme_setup_sgl_simple(struct nvme_dev *dev,
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 
+-	iod->first_dma = dma_map_bvec(dev->dev, bv, rq_dma_dir(req), 0);
+-	if (dma_mapping_error(dev->dev, iod->first_dma))
+-		return BLK_STS_RESOURCE;
++	if (bv->bv_dma_start) {
++		iod->persistent = true;
++		iod->first_dma = bv->bv_dma_start;
++	} else {
++		iod->first_dma = dma_map_bvec(dev->dev, bv, rq_dma_dir(req), 0);
++		if (dma_mapping_error(dev->dev, iod->first_dma))
++			return BLK_STS_RESOURCE;
++	}
+ 	iod->dma_len = bv->bv_len;
+ 
+ 	cmnd->flags = NVME_CMD_SGL_METABUF;
+@@ -909,6 +921,7 @@ static blk_status_t nvme_prep_rq(struct nvme_dev *dev, struct request *req)
+ 	blk_status_t ret;
+ 
+ 	iod->aborted = false;
++	iod->persistent = false;
+ 	iod->npages = -1;
+ 	iod->nents = 0;
+ 
+@@ -1718,6 +1731,46 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid, bool polled)
+ 	return result;
+ }
+ 
++#ifdef CONFIG_HAS_DMA
++static int nvme_pci_dma_map_bvec(struct nvme_dev *ndev, struct bio_vec *bv,
++				 int dma_dir)
++{
++	dma_addr_t dma_addr;
++
++	dma_addr = dma_map_bvec(ndev->dev, bv, dma_dir, 0);
++	if (dma_mapping_error(ndev->dev, dma_addr))
++		return -EIO;
++
++	bv->bv_dma_start = dma_addr;
++	return 0;
++}
++
++static struct device *nvme_pci_dma_map(struct request_queue *q,
++				       struct bio_vec *bvec, int nr_vecs,
++				       int dma_dir)
++{
++	struct nvme_ns *ns = q->queuedata;
++	struct nvme_dev *ndev = to_nvme_dev(ns->ctrl);
++	int i, ret = -EINVAL;
++
++	for (i = 0; i < nr_vecs; i++) {
++		ret = nvme_pci_dma_map_bvec(ndev, bvec + i, dma_dir);
++		if (ret)
++			goto err;
++	}
++
++	get_device(ndev->dev);
++	return ndev->dev;
++err:
++	while (--i >= 0) {
++		struct bio_vec *bv = bvec + i;
++
++		dma_unmap_page(ndev->dev, bv->bv_dma_start, bv->bv_len, 0);
++	}
++	return ERR_PTR(ret);
++}
++#endif
++
+ static const struct blk_mq_ops nvme_mq_admin_ops = {
+ 	.queue_rq	= nvme_queue_rq,
+ 	.complete	= nvme_pci_complete_rq,
+@@ -1736,6 +1789,9 @@ static const struct blk_mq_ops nvme_mq_ops = {
+ 	.map_queues	= nvme_pci_map_queues,
+ 	.timeout	= nvme_timeout,
+ 	.poll		= nvme_poll,
++#ifdef CONFIG_HAS_DMA
++	.dma_map	= nvme_pci_dma_map,
++#endif
+ };
+ 
+ static void nvme_dev_remove_admin(struct nvme_dev *dev)
+-- 
+2.35.1
+
+
+From 6323c5941b5d19ca751abfa5a58835c1676283b2 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sat, 16 Oct 2021 08:20:13 -0600
+Subject: [PATCH 10/15] nvme: don't copy fill bio_vec if we don't have to
+
+For the fast case, we haven't done any IO on the bio yet. Hence just check
+and return a pointer to the inlined bio_vec, rather than copying it. In
+profiles, this results in a nice reduction in overhead for
+nvme_queue_rq():
+
+     5.41%     -2.48%  [nvme]            [k] nvme_queue_rq
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ drivers/nvme/host/pci.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 92c5d5284ff4..5feea9914176 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -854,17 +854,24 @@ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
+ 	int nr_mapped;
+ 
+ 	if (blk_rq_nr_phys_segments(req) == 1) {
+-		struct bio_vec bv = req_bvec(req);
++		struct bio_vec __bv, *bv = &__bv;
+ 
+-		if (!is_pci_p2pdma_page(bv.bv_page)) {
+-			if (bv.bv_offset + bv.bv_len <= NVME_CTRL_PAGE_SIZE * 2)
++		if (req->rq_flags & RQF_SPECIAL_PAYLOAD)
++			bv = &req->special_vec;
++		else if (!req->bio->bi_iter.bi_bvec_done)
++			bv = &req->bio->bi_io_vec[req->bio->bi_iter.bi_idx];
++		else
++			__bv = req_bvec(req);
++
++		if (!is_pci_p2pdma_page(bv->bv_page)) {
++			if (bv->bv_offset + bv->bv_len <= NVME_CTRL_PAGE_SIZE * 2)
+ 				return nvme_setup_prp_simple(dev, req,
+-							     &cmnd->rw, &bv);
++							     &cmnd->rw, bv);
+ 
+ 			if (iod->nvmeq->qid && sgl_threshold &&
+ 			    nvme_ctrl_sgl_supported(&dev->ctrl))
+ 				return nvme_setup_sgl_simple(dev, req,
+-							     &cmnd->rw, &bv);
++							     &cmnd->rw, bv);
+ 		}
+ 	}
+ 
+-- 
+2.35.1
+
+
+From 7d77b0685e8be39409380e5ff0aa0fec7a1d2f6e Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 5 Nov 2021 17:11:34 -0600
+Subject: [PATCH 11/15] io_uring: remove sq/cq_off memset
+
+We only have two reserved members we're not clearing, do so manually
+instead. This is in preparation for using one of these members for
+a new feature.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ fs/io_uring.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 0bb57100dbc8..cdf6c4f9ee7d 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -10652,7 +10652,6 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 		goto err;
+ 	io_rsrc_node_switch(ctx, NULL);
+ 
+-	memset(&p->sq_off, 0, sizeof(p->sq_off));
+ 	p->sq_off.head = offsetof(struct io_rings, sq.head);
+ 	p->sq_off.tail = offsetof(struct io_rings, sq.tail);
+ 	p->sq_off.ring_mask = offsetof(struct io_rings, sq_ring_mask);
+@@ -10660,8 +10659,9 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 	p->sq_off.flags = offsetof(struct io_rings, sq_flags);
+ 	p->sq_off.dropped = offsetof(struct io_rings, sq_dropped);
+ 	p->sq_off.array = (char *)ctx->sq_array - (char *)ctx->rings;
++	p->sq_off.resv1 = 0;
++	p->sq_off.resv2 = 0;
+ 
+-	memset(&p->cq_off, 0, sizeof(p->cq_off));
+ 	p->cq_off.head = offsetof(struct io_rings, cq.head);
+ 	p->cq_off.tail = offsetof(struct io_rings, cq.tail);
+ 	p->cq_off.ring_mask = offsetof(struct io_rings, cq_ring_mask);
+@@ -10669,6 +10669,8 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 	p->cq_off.overflow = offsetof(struct io_rings, cq_overflow);
+ 	p->cq_off.cqes = offsetof(struct io_rings, cqes);
+ 	p->cq_off.flags = offsetof(struct io_rings, cq_flags);
++	p->cq_off.resv1 = 0;
++	p->cq_off.resv2 = 0;
+ 
+ 	p->features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP |
+ 			IORING_FEAT_SUBMIT_STABLE | IORING_FEAT_RW_CUR_POS |
+-- 
+2.35.1
+
+
+From 4f832091b014b845d4faa081ffeb9e66c261d99e Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 5 Nov 2021 17:13:52 -0600
+Subject: [PATCH 12/15] io_uring: return error pointer from io_mem_alloc()
+
+In preparation for having more than one time of ring allocator, make the
+existing one return valid/error-pointer rather than just NULL.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ fs/io_uring.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index cdf6c4f9ee7d..fba08b5d926c 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -8945,9 +8945,14 @@ static void io_mem_free(void *ptr)
+ 
+ static void *io_mem_alloc(size_t size)
+ {
++  void *ret;
++
+ 	gfp_t gfp = GFP_KERNEL_ACCOUNT | __GFP_ZERO | __GFP_NOWARN | __GFP_COMP;
+ 
+-	return (void *) __get_free_pages(gfp, get_order(size));
++	ret = (void *) __get_free_pages(gfp, get_order(size));
++  if (ret)
++		return ret;
++	return ERR_PTR(-ENOMEM);
+ }
+ 
+ static unsigned long rings_size(unsigned sq_entries, unsigned cq_entries,
+@@ -10494,6 +10499,7 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ {
+ 	struct io_rings *rings;
+ 	size_t size, sq_array_offset;
++	void *ptr;
+ 
+ 	/* make sure these are sane, as we already accounted them */
+ 	ctx->sq_entries = p->sq_entries;
+@@ -10504,8 +10510,8 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 		return -EOVERFLOW;
+ 
+ 	rings = io_mem_alloc(size);
+-	if (!rings)
+-		return -ENOMEM;
++	if (IS_ERR(rings))
++		return PTR_ERR(rings);
+ 
+ 	ctx->rings = rings;
+ 	ctx->sq_array = (u32 *)((char *)rings + sq_array_offset);
+@@ -10521,13 +10527,14 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 		return -EOVERFLOW;
+ 	}
+ 
+-	ctx->sq_sqes = io_mem_alloc(size);
+-	if (!ctx->sq_sqes) {
++	ptr = io_mem_alloc(size);
++	if (IS_ERR(ptr)) {
+ 		io_mem_free(ctx->rings);
+ 		ctx->rings = NULL;
+-		return -ENOMEM;
++		return PTR_ERR(ptr);
+ 	}
+ 
++	ctx->sq_sqes = io_mem_alloc(size);
+ 	return 0;
+ }
+ 
+-- 
+2.35.1
+
+
+From 597d92028ee884bff279bee316373fc6debf440d Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 5 Nov 2021 17:15:46 -0600
+Subject: [PATCH 13/15] io_uring: add ring freeing helper
+
+We do rings and sqes separately, move them into a helper that does both
+the freeing and clearing of the memory.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ fs/io_uring.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index fba08b5d926c..e63381fb88b5 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -8943,6 +8943,14 @@ static void io_mem_free(void *ptr)
+ 		free_compound_page(page);
+ }
+ 
++static void io_rings_free(struct io_ring_ctx *ctx)
++{
++	io_mem_free(ctx->rings);
++	io_mem_free(ctx->sq_sqes);
++	ctx->rings = NULL;
++	ctx->sq_sqes = NULL;
++}
++
+ static void *io_mem_alloc(size_t size)
+ {
+   void *ret;
+@@ -9596,8 +9604,7 @@ static __cold void io_ring_ctx_free(struct io_ring_ctx *ctx)
+ #endif
+ 	WARN_ON_ONCE(!list_empty(&ctx->ltimeout_list));
+ 
+-	io_mem_free(ctx->rings);
+-	io_mem_free(ctx->sq_sqes);
++	io_rings_free(ctx);
+ 
+ 	percpu_ref_exit(&ctx->refs);
+ 	free_uid(ctx->user);
+@@ -10522,15 +10529,13 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 
+ 	size = array_size(sizeof(struct io_uring_sqe), p->sq_entries);
+ 	if (size == SIZE_MAX) {
+-		io_mem_free(ctx->rings);
+-		ctx->rings = NULL;
++		io_rings_free(ctx);
+ 		return -EOVERFLOW;
+ 	}
+ 
+ 	ptr = io_mem_alloc(size);
+ 	if (IS_ERR(ptr)) {
+-		io_mem_free(ctx->rings);
+-		ctx->rings = NULL;
++		io_rings_free(ctx);
+ 		return PTR_ERR(ptr);
+ 	}
+ 
+-- 
+2.35.1
+
+
+From 89e43879c09620f7b8169ae0e74d9fc7f576ee1d Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 5 Nov 2021 17:20:54 -0600
+Subject: [PATCH 14/15] io_uring: support for user allocated memory for
+ rings/sqes
+
+Currently io_uring applications must call mmap(2) twice to map the rings
+themselves, and the sqes array. This works fine, but it does not support
+using huge pages to back the rings/sqes.
+
+Provide a way for the application to pass in pre-allocated memory for
+the rings/sqes, which can then suitably be allocated from shmfs or
+via mmap to get huge page support.
+
+Particularly for larger rings, this reduces the TLBs needed.
+
+If an application wishes to take advantage of that, it must pre-allocate
+the memory needed for the sq/cq ring, and the sqes. The former must
+be passed in via the io_uring_params->cq_off.user_data field, while the
+latter is passed in via the io_uring_params->sq_off.user_data field. Then
+it must set IORING_SETUP_NO_MMAP in the io_uring_params->flags field,
+and io_uring will then map the existing memory into the kernel for shared
+use. The application must not call mmap(2) to map rings as it otherwise
+would have, that will now fail with -EINVAL if this setup flag was used.
+
+The pages used for the rings and sqes must be contigious. The intent here
+is clearly that huge pages should be used, otherwise the normal setup
+procedure works fine as-is. The application may use one huge page for
+both the rings and sqes.
+
+Outside of those initialization changes, everything works like it did
+before.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ fs/io_uring.c                 | 121 ++++++++++++++++++++++++++++++----
+ include/uapi/linux/io_uring.h |   5 +-
+ 2 files changed, 113 insertions(+), 13 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index e63381fb88b5..daa04153968b 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -335,6 +335,16 @@ struct io_ring_ctx {
+ 		struct percpu_ref	refs;
+ 
+ 		struct io_rings		*rings;
++
++		/*
++		 * If IORING_SETUP_NO_MMAP is used, then the below holds
++		 * the gup'ed pages for the two rings, and the sqes.
++		 */
++		struct page		**ring_pages;
++		struct page		**sqe_pages;
++		int			n_ring_pages;
++		int			n_sqe_pages;
++
+ 		unsigned int		flags;
+ 		unsigned int		compat: 1;
+ 		unsigned int		drain_next: 1;
+@@ -8943,12 +8953,80 @@ static void io_mem_free(void *ptr)
+ 		free_compound_page(page);
+ }
+ 
++static void io_pages_free(struct page ***pages, int npages)
++{
++	struct page **page_array;
++	int i;
++
++	if (!pages)
++		return;
++	page_array = *pages;
++	for (i = 0; i < npages; i++)
++		unpin_user_page(page_array[i]);
++	kvfree(page_array);
++	*pages = NULL;
++}
++
++static void *__io_uaddr_map(struct page ***pages, int *npages,
++			    unsigned long uaddr, size_t size)
++{
++	struct page **page_array;
++	int ret;
++
++	if (uaddr & (PAGE_SIZE - 1) || !size)
++		return ERR_PTR(-EINVAL);
++
++	*npages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
++	page_array = kvmalloc_array(*npages, sizeof(struct page *), GFP_KERNEL);
++	if (!page_array) {
++		*npages = 0;
++		return ERR_PTR(-ENOMEM);
++	}
++
++	mmap_read_lock(current->mm);
++	ret = pin_user_pages_fast(uaddr, *npages, FOLL_WRITE | FOLL_LONGTERM,
++					page_array);
++	mmap_read_unlock(current->mm);
++	if (ret != *npages) {
++err:
++		if (ret > 0)
++			io_pages_free(&page_array, ret);
++		*npages = 0;
++		return ret < 0 ? ERR_PTR(ret) : ERR_PTR(-EFAULT);
++	}
++	/* pages must be contig */
++	ret--;
++	if (page_array[0] + ret != page_array[ret])
++		goto err;
++	*pages = page_array;
++	return page_to_virt(page_array[0]);
++}
++
++static void *io_rings_map(struct io_ring_ctx *ctx, unsigned long uaddr,
++			  size_t size)
++{
++	return __io_uaddr_map(&ctx->ring_pages, &ctx->n_ring_pages, uaddr,
++				size);
++}
++
++static void *io_sqes_map(struct io_ring_ctx *ctx, unsigned long uaddr,
++			 size_t size)
++{
++	return __io_uaddr_map(&ctx->sqe_pages, &ctx->n_sqe_pages, uaddr,
++				size);
++}
++
+ static void io_rings_free(struct io_ring_ctx *ctx)
+ {
+-	io_mem_free(ctx->rings);
+-	io_mem_free(ctx->sq_sqes);
+-	ctx->rings = NULL;
+-	ctx->sq_sqes = NULL;
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP)) {
++		io_mem_free(ctx->rings);
++		io_mem_free(ctx->sq_sqes);
++		ctx->rings = NULL;
++		ctx->sq_sqes = NULL;
++	} else {
++		io_pages_free(&ctx->ring_pages, ctx->n_ring_pages);
++		io_pages_free(&ctx->sqe_pages, ctx->n_sqe_pages);
++	}
+ }
+ 
+ static void *io_mem_alloc(size_t size)
+@@ -10142,10 +10220,15 @@ static void *io_uring_validate_mmap_request(struct file *file,
+ 
+ static __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+ {
++	struct io_ring_ctx *ctx = file->private_data;
+ 	size_t sz = vma->vm_end - vma->vm_start;
+ 	unsigned long pfn;
+ 	void *ptr;
+ 
++	/* Don't allow mmap if the ring was setup without it */
++	if (ctx->flags & IORING_SETUP_NO_MMAP)
++		return -EINVAL;
++
+ 	ptr = io_uring_validate_mmap_request(file, vma->vm_pgoff, sz);
+ 	if (IS_ERR(ptr))
+ 		return PTR_ERR(ptr);
+@@ -10158,6 +10241,12 @@ static __cold int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+ 
+ static int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+ {
++	struct io_ring_ctx *ctx = file->private_data;
++
++	/* Don't allow mmap if the ring was setup without it */
++	if (ctx->flags & IORING_SETUP_NO_MMAP)
++		return -EINVAL;
++
+ 	return vma->vm_flags & (VM_SHARED | VM_MAYSHARE) ? 0 : -EINVAL;
+ }
+ 
+@@ -10516,7 +10605,11 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 	if (size == SIZE_MAX)
+ 		return -EOVERFLOW;
+ 
+-	rings = io_mem_alloc(size);
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP))
++		rings = io_mem_alloc(size);
++	else
++		rings = io_rings_map(ctx, p->cq_off.user_addr, size);
++
+ 	if (IS_ERR(rings))
+ 		return PTR_ERR(rings);
+ 
+@@ -10533,13 +10626,17 @@ static __cold int io_allocate_scq_urings(struct io_ring_ctx *ctx,
+ 		return -EOVERFLOW;
+ 	}
+ 
+-	ptr = io_mem_alloc(size);
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP))
++		ptr = io_mem_alloc(size);
++	else
++		ptr = io_sqes_map(ctx, p->sq_off.user_addr, size);
++
+ 	if (IS_ERR(ptr)) {
+ 		io_rings_free(ctx);
+ 		return PTR_ERR(ptr);
+ 	}
+ 
+-	ctx->sq_sqes = io_mem_alloc(size);
++	ctx->sq_sqes = ptr;
+ 	return 0;
+ }
+ 
+@@ -10672,7 +10769,8 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 	p->sq_off.dropped = offsetof(struct io_rings, sq_dropped);
+ 	p->sq_off.array = (char *)ctx->sq_array - (char *)ctx->rings;
+ 	p->sq_off.resv1 = 0;
+-	p->sq_off.resv2 = 0;
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP))
++		p->sq_off.user_addr = 0;
+ 
+ 	p->cq_off.head = offsetof(struct io_rings, cq.head);
+ 	p->cq_off.tail = offsetof(struct io_rings, cq.tail);
+@@ -10682,7 +10780,8 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 	p->cq_off.cqes = offsetof(struct io_rings, cqes);
+ 	p->cq_off.flags = offsetof(struct io_rings, cq_flags);
+ 	p->cq_off.resv1 = 0;
+-	p->cq_off.resv2 = 0;
++	if (!(ctx->flags & IORING_SETUP_NO_MMAP))
++		p->cq_off.user_addr = 0;
+ 
+ 	p->features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP |
+ 			IORING_FEAT_SUBMIT_STABLE | IORING_FEAT_RW_CUR_POS |
+@@ -10740,10 +10839,10 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
+ 	if (p.flags & ~(IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL |
+ 			IORING_SETUP_SQ_AFF | IORING_SETUP_CQSIZE |
+ 			IORING_SETUP_CLAMP | IORING_SETUP_ATTACH_WQ |
+-			IORING_SETUP_R_DISABLED))
++			IORING_SETUP_R_DISABLED | IORING_SETUP_NO_MMAP))
+ 		return -EINVAL;
+ 
+-	return  io_uring_create(entries, &p, params);
++	return io_uring_create(entries, &p, params);
+ }
+ 
+ SYSCALL_DEFINE2(io_uring_setup, u32, entries,
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index 3ddc5a08cff3..6ad8ef7a7632 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -101,6 +101,7 @@ enum {
+ #define IORING_SETUP_CLAMP	(1U << 4)	/* clamp SQ/CQ ring sizes */
+ #define IORING_SETUP_ATTACH_WQ	(1U << 5)	/* attach to existing wq */
+ #define IORING_SETUP_R_DISABLED	(1U << 6)	/* start with ring disabled */
++#define IORING_SETUP_NO_MMAP	(1U << 7)	/* application provides memory */
+ 
+ enum {
+ 	IORING_OP_NOP,
+@@ -226,7 +227,7 @@ struct io_sqring_offsets {
+ 	__u32 dropped;
+ 	__u32 array;
+ 	__u32 resv1;
+-	__u64 resv2;
++	__u64 user_addr;
+ };
+ 
+ /*
+@@ -244,7 +245,7 @@ struct io_cqring_offsets {
+ 	__u32 cqes;
+ 	__u32 flags;
+ 	__u32 resv1;
+-	__u64 resv2;
++	__u64 user_addr;
+ };
+ 
+ /*
+-- 
+2.35.1
+
+
+From c23926bbac24dccfbc42a57ef0b6dae6927d8359 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 2 Dec 2021 13:14:53 -0700
+Subject: [PATCH 15/15] block: enable bio allocation cache for IRQ driven IO
+
+We currently cannot use the bio recycling allocation cache for IRQ driven
+IO, as the cache isn't IRQ safe (by design).
+
+Add a way for the completion side to pass back a bio that needs freeing,
+so we can do it from the io_uring side. io_uring completions always
+run in task context.
+
+This is good for about a 13% improvement in IRQ driven IO, taking us from
+around 6.3M/core to 7.1M/core IOPS.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Dimitar Atanasov <datanasov@cpdbg.com>
+---
+ block/fops.c       | 11 ++++++++---
+ fs/io_uring.c      | 13 ++++++++++++-
+ include/linux/fs.h |  4 ++++
+ 3 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/block/fops.c b/block/fops.c
+index a18e7fbd97b8..3c9dd195506e 100644
+--- a/block/fops.c
++++ b/block/fops.c
+@@ -298,14 +298,19 @@ static void blkdev_bio_end_io_async(struct bio *bio)
+ 		ret = blk_status_to_errno(bio->bi_status);
+ 	}
+ 
+-	iocb->ki_complete(iocb, ret);
+-
+ 	if (dio->flags & DIO_SHOULD_DIRTY) {
+ 		bio_check_pages_dirty(bio);
+ 	} else {
+ 		bio_release_pages(bio, false);
+-		bio_put(bio);
++		if (iocb->ki_flags & IOCB_BIO_PASSBACK) {
++			iocb->ki_flags |= IOCB_PRIV_IS_BIO;
++			iocb->private = bio;
++		} else {
++			bio_put(bio);
++		}
+ 	}
++
++	iocb->ki_complete(iocb, ret);
+ }
+ 
+ static ssize_t __blkdev_direct_IO_async(struct kiocb *iocb,
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index daa04153968b..ffb1d4c5f677 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -2840,7 +2840,7 @@ static bool __io_complete_rw_common(struct io_kiocb *req, long res)
+ 	return false;
+ }
+ 
+-static inline void io_req_task_complete(struct io_kiocb *req, bool *locked)
++static inline void __io_req_task_complete(struct io_kiocb *req, bool *locked)
+ {
+ 	unsigned int cflags = io_put_kbuf(req);
+ 	int res = req->result;
+@@ -2853,6 +2853,16 @@ static inline void io_req_task_complete(struct io_kiocb *req, bool *locked)
+ 	}
+ }
+ 
++static void io_req_task_complete(struct io_kiocb *req, bool *locked)
++{
++#ifdef CONFIG_BLOCK
++	if (req->rw.kiocb.ki_flags & IOCB_PRIV_IS_BIO)
++		bio_put(req->rw.kiocb.private);
++#endif
++
++	__io_req_task_complete(req, locked);
++}
++
+ static void __io_complete_rw(struct io_kiocb *req, long res,
+ 			     unsigned int issue_flags)
+ {
+@@ -3045,6 +3055,7 @@ static int io_prep_rw(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ 	} else {
+ 		if (kiocb->ki_flags & IOCB_HIPRI)
+ 			return -EINVAL;
++		kiocb->ki_flags |= IOCB_ALLOC_CACHE | IOCB_BIO_PASSBACK;
+ 		kiocb->ki_complete = io_complete_rw;
+ 	}
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index e2d892b201b0..d85608b25c64 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -316,6 +316,10 @@ enum rw_hint {
+ #define IOCB_NOIO		(1 << 20)
+ /* can use bio alloc cache */
+ #define IOCB_ALLOC_CACHE	(1 << 21)
++/* iocb supports bio passback */
++#define IOCB_BIO_PASSBACK	(1 << 22)
++/* iocb->private holds bio to put */
++#define IOCB_PRIV_IS_BIO	(1 << 23)
+ 
+ struct kiocb {
+ 	struct file		*ki_filp;
+-- 
+2.35.1
+
